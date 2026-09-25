@@ -442,12 +442,10 @@ implementation-specific variable communication packets directly.
 - It couples the operating system to the firmware's internal architecture.
 - Not written to work with device-based services such as from a coprocessor.
 
-This RFC instead defines the smallest interface needed to preserve the UEFI
-variable service contract.
-
 ## Implementation Design
 
-The chosen design uses a firmware-described shared memory communication buffer
+The chosen design uses a standard packet-based transactions with set rules
+currently defined to use a firmware-described shared memory communication buffer
 (mailbox) paired with a discoverable notification method (doorbell). The operating
 system writes a request, signals the doorbell, and waits for the service to
 publish a matching response. No firmware code executes in the operating system
@@ -588,11 +586,13 @@ by its version.
   cacheability guarantees defined below.
 
 `CommunicationBufferAddress` is the physical address of the communication
-buffer.
+buffer. If a future transport does not support the mailbox, then this field will
+be `NULL` and any relevant addresses will be provided via the transport data.
 
 `CommunicationBufferSize` is the size of the communication buffer in bytes. It
 must be page aligned and large enough for the platform's maximum supported
-variable transaction plus the communication header.
+variable transaction plus the communication header. If a future transport does
+not support the mailbox, then this field will be `0`.
 
 `DoorbellDataOffset` is the byte offset from the beginning of the configuration
 table to the selected doorbell data. It is zero when the doorbell requires no
@@ -816,10 +816,9 @@ typedef struct {
 } EFI_DIRECT_VAR_GET_VARIABLE_RESPONSE;
 ```
 
-The command preserves the size-query behavior of `GetVariable()`. When the
-provided response capacity is insufficient, the service returns
-`EFI_BUFFER_TOO_SMALL` and reports the required `DataSize` without writing data
-beyond the response capacity.
+The mirrors [`GetVariable()`](https://uefi.org/specs/UEFI/2.11/08_Services_Runtime_Services.html#getvariable),
+but does not implement the size querying behavior as the communication buffer
+is guaranteed to be large enough for the max variable size.
 
 #### Get Variable Names
 
@@ -833,9 +832,14 @@ typedef struct {
 ```
 
 An empty name starts enumeration. Otherwise, the GUID and name identify the
-last variable observed by the caller.
+last variable observed by the caller, preserving the enumeration behavior of
+[`GetNextVariableName()`](https://uefi.org/specs/UEFI/2.11/08_Services_Runtime_Services.html#getnextvariablename).
 
 Response:
+
+The response for the direct variable will provide as many of the next variables
+possible within the size of the communication buffer to optimize the number of
+service invocations is necessary.
 
 ```c
 #define EFI_DIRECT_VAR_NAMES_FLAG_COMPLETED  0x00000001
@@ -852,7 +856,7 @@ typedef struct {
 } EFI_DIRECT_VAR_NAME_ENTRY;
 ```
 
-`Length` is the total byte length of the entry and is aligned to 8 bytes. The
+`Length` is the total byte length of the entry, aligned up to 8 bytes. The
 next entry begins at the indicated offset. The service sets
 `EFI_DIRECT_VAR_NAMES_FLAG_COMPLETED` when no additional variables remain.
 
@@ -871,14 +875,20 @@ typedef struct {
 } EFI_DIRECT_VAR_SET_VARIABLE;
 ```
 
-`DataOffset` is the byte offset from the start of the packet to the variable
+`DataOffset` is the 8-byte aligned offset from the start of the packet to the variable
 data. The variable name and data must both lie fully within `RequestSize` and
 must not overlap in a way that changes their interpretation. The service applies
 the same creation, replacement, append, deletion, policy, and authentication
-rules as `SetVariable()`.
+rules as
+[`SetVariable()`](https://uefi.org/specs/UEFI/2.11/08_Services_Runtime_Services.html#setvariable).
 
-The response has no command-specific payload. The operation result is returned
-in `ResponseStatus`.
+Response:
+
+On success, the entirety of the response data will be the contents of the written
+variable. This should be identical to the provided data in all cases except
+appends to an authenticated variable. Due to the offsets involved, the
+implementor can simply update the data offset to point to the callers original
+data in every other case.
 
 #### Query Variable Info
 
@@ -900,12 +910,14 @@ typedef struct {
 } EFI_DIRECT_VAR_QUERY_VARIABLE_INFO_RESPONSE;
 ```
 
-The result must match `QueryVariableInfo()` for the same attribute combination.
+The result must match
+[`QueryVariableInfo()`](https://uefi.org/specs/UEFI/2.11/08_Services_Runtime_Services.html#queryvariableinfo)
+for the same attribute combination.
 
 #### Get All Variables
 
-This optional bulk command reduces management mode transitions when initially
-populating a caller cache.
+This bulk command reduces management mode transitions when initially populating
+a caller cache.
 
 Request:
 
@@ -944,6 +956,14 @@ The service may return a partial list when all remaining entries do not fit. The
 caller resumes using the GUID and name of the final returned entry. The service
 sets `EFI_DIRECT_VAR_ALL_FLAG_COMPLETED` when no additional variables remain.
 
+#### Packet Extension
+
+The current definition of direct variables uses a mailbox and doorbell method,
+but future instances may use transports that do not support the required memory
+or MMIO access. Such future transports, such as MMBI or I3C, may be defined to
+use the direct method but with an appropriate transport data in the table to
+define their communication method.
+
 ### Variable Caching
 
 Entering management mode for every variable read can cause a significant
@@ -963,8 +983,8 @@ invalidation signal.
 
 #### Cacheability Attribute
 
-The following variable attribute is proposed for UEFI Specification section
-8.2:
+The following variable attribute is proposed for [UEFI Specification section
+8.2](https://uefi.org/specs/UEFI/2.11/08_Services_Runtime_Services.html#variable-services):
 
 ```c
 #define EFI_VARIABLE_NOT_CACHEABLE  0x00000100
@@ -976,13 +996,15 @@ operating system observed no write. Platforms must apply this attribute to any
 variable that may be modified by management mode, a secure partition, another
 processor, or another environment with access to the variable store.
 
-The attribute belongs to the platform and describes a property of the variable;
-it is not a caching request from the caller.
+The attribute belongs to the platform and describes a property of the variable.
+Tt is not a caching request from the caller.
 
 - The attribute is reported by both `GetVariable()` and direct get commands so
   callers observe the same property through either interface.
 - The attribute affects caching only. The variable is otherwise read and
   written normally.
+- Only platform code should create a variable with the `EFI_VARIABLE_NOT_CACHEABLE`
+  attribute.
 
 #### Platform Guarantees
 
@@ -991,25 +1013,20 @@ following while the direct interface remains in use:
 
 1. A variable not marked `EFI_VARIABLE_NOT_CACHEABLE` will not be altered by
    another runtime environment.
-2. A cacheable variable will not be created or deleted except by the caller.
-   This permits the caller to cache negative lookups and enumeration results.
-3. The attributes and vendor GUID of a cacheable variable will not change
-   except as the result of a caller write.
+2. A cacheable variable will not be created, altered, or deleted except by the
+   caller.
 
 A platform that cannot make every guarantee must leave the flag clear.
 
 #### Caller Behavior
 
 The caller may maintain a cache keyed by vendor GUID and variable name, holding
-the attributes and data most recently observed. The cache is an optimization;
+the attributes and data most recently observed. The cache is an optimization and
 discarding it must not affect correctness.
 
 A caching caller must:
 
-- Never cache a variable whose attributes include
-  `EFI_VARIABLE_NOT_CACHEABLE`.
-- Update a cached entry after a successful `SET_VARIABLE`, except for append and
-  authenticated writes.
+- Never cache a variable whose attributes include `EFI_VARIABLE_NOT_CACHEABLE`.
 - Invalidate the entry after a failed `SET_VARIABLE` rather than assume the
   store is unchanged.
 - Never cache `QUERY_VARIABLE_INFO` results because storage figures may change
@@ -1017,14 +1034,15 @@ A caching caller must:
 - Invalidate affected namespace and enumeration entries when it creates or
   deletes a variable.
 
-Append writes must invalidate the entry because the stored representation
-depends on its previous contents and may involve a service-defined merge.
+A caching caller may:
 
-Authenticated writes must invalidate the entry because the submitted buffer
-contains an authentication descriptor that is consumed by the service and is
-not part of the value returned by a later read. This applies to
-`EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS` and
-`EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS`.
+- Update a cached entry after a successful `SET_VARIABLE` to a variable without
+  the `EFI_VARIABLE_NOT_CACHEABLE` attribute.
+
+When writed to Authenticated variables, the caller should only cache the value
+of the variable returned by the `SET_VARIABLE` call as the contents of certain
+operations like `EFI_VARIABLE_TIME_BASED_AUTHENTICATED_WRITE_ACCESS` and
+`EFI_VARIABLE_ENHANCED_AUTHENTICATED_ACCESS` are not predictable to the caller.
 
 The cache may contain security state such as `SecureBoot`, `db`, and `dbx`. It
 must receive the same integrity protection as other security-critical operating
@@ -1144,15 +1162,11 @@ configuration table. If the table, communication buffer, and doorbell are
 supported, retain the required mappings and serialize all access to the
 mailbox. After `ExitBootServices()`, submit variable commands through the
 mailbox and use matching request and response identifiers to determine
-completion.
-
-If discovery or validation fails, continue using traditional UEFI runtime
-variable services. Do not fall back to those services to retry a direct request
-that may still be outstanding.
+completion. If discovery or validation fails, continue using traditional UEFI
+runtime variable services.
 
 Caching is optional. Only cache variables when the platform advertises the
-caching flag, and never cache a variable marked
-`EFI_VARIABLE_NOT_CACHEABLE`.
+caching flag, and never cache a variable marked `EFI_VARIABLE_NOT_CACHEABLE`.
 
 ### For Firmware Developers
 
@@ -1179,11 +1193,3 @@ The platform integration must define memory attributes, cache maintenance, and
 recovery behavior for the selected doorbell. It must also identify every
 variable that can be changed out of band by applying
 `EFI_VARIABLE_NOT_CACHEABLE`.
-
-### For End Users
-
-There is no required user-visible workflow change. On systems where both
-firmware and the operating system support this interface, variable operations
-can occur without executing inherited firmware runtime code in the operating
-system trust domain. Existing systems and operating systems continue to use the
-traditional runtime services.
