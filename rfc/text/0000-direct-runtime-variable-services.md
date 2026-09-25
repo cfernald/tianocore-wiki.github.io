@@ -160,11 +160,6 @@ structure coordinates readers and management mode updates through `ReadLock`,
 the steady state, management mode is entered on the first read after an
 out-of-band update, and writes always enter management mode.
 
-This design is useful within firmware, but publishing it to an operating system
-would standardize the firmware's internal variable store format and coherency
-protocol. The caching mechanism in this RFC instead lets the caller construct a
-cache in its own format from normal protocol responses.
-
 ## Goals
 
 1. Remove inherited UEFI runtime variable code and data from the operating
@@ -175,7 +170,7 @@ cache in its own format from normal protocol responses.
    size-query behavior.
 3. Allow an operating system loader to discover and validate the interface
    before `ExitBootServices()` while keeping the service available afterward.
-4. Define an architecture- and platform-independent data model with a small,
+4. Define an architecture and platform-independent data model with a small,
    discoverable platform-specific doorbell.
 5. Preserve firmware security policy, including authenticated variable checks,
    access restrictions, and protection of data from untrusted agents.
@@ -201,52 +196,54 @@ cache in its own format from normal protocol responses.
 
 ## Requirements
 
-1. The interface must be optional and discoverable before
-   `ExitBootServices()`.
-2. The communication buffer and selected doorbell must remain available while
-   the direct interface is in use.
-3. Only one transaction may be outstanding for a communication buffer.
-4. The protocol must not depend on whether the doorbell completes
-   synchronously or asynchronously.
-5. The caller and service must have an unambiguous ownership transfer for the
-   communication buffer.
-6. Request and response publication must define memory ordering and any
-   required platform cache maintenance.
-7. A caller timeout must not be treated as transaction cancellation.
-8. Requests and responses must be bounded by the advertised communication
-   buffer size and independently validated by both parties.
-9. The service must apply the same variable policy and authentication checks as
-   the traditional runtime services.
-10. A platform advertising variable caching must identify variables that can
-    change outside the caller's observation.
-11. Unknown versions, flags, commands, and malformed offsets or sizes must fail
-    safely.
+1. An operating system must be able to use variable services after
+   `ExitBootServices()` without executing inherited firmware code within its
+   trust domain.
+2. Adoption must be optional for both the platform and the operating system,
+   and an operating system must be able to determine before
+   `ExitBootServices()` whether the interface is suitable for use.
+3. The direct interface must preserve the externally observable semantics of
+   the UEFI variable services so that using it does not change variable-service
+   behavior.
+4. The interface must not expose or require knowledge of the firmware's
+   internal variable-store representation or isolated execution environment.
+5. The service must preserve firmware ownership of variable policy,
+   authentication, access control, and persistent storage.
+6. The interface must remain correct and deterministic across supported
+   architectures and platform transports, including under concurrent access,
+   delayed completion, and failure.
+7. Untrusted or incompatible input must not compromise firmware, disclose
+   protected data, or cause unsafe state changes.
+8. Optional performance features, including caller-managed caching, must not
+   weaken variable coherency or the security properties of the service.
+9. The interface must support backward-compatible evolution and allow
+   unsupported capabilities to be rejected safely.
+10. Platforms and operating systems that do not adopt the direct interface
+    must retain the existing UEFI runtime variable services and behavior.
 
 ## UEFI/PI Specification Impact
 
 This RFC requires an update to the UEFI Specification. The proposal is tracked
 through the EDK II Code First process in
-[tianocore/edk2#13192](https://github.com/tianocore/edk2/issues/13192).
+[[Code First]: Direct Runtime Variable Services](https://github.com/tianocore/edk2/issues/13192).
 
 The UEFI Specification change is expected to define:
 
 - A configuration table used to discover Direct Runtime Variable Services.
-- The communication buffer header and command packet formats.
-- Standard doorbell descriptions and a mechanism for adding new descriptions.
-- Buffer ownership, synchronization, memory ordering, cache maintenance, and
-  timeout behavior.
-- The optional `EFI_VARIABLE_NOT_CACHEABLE` variable attribute.
-- The platform guarantees associated with caller-managed variable caching.
-- The requirement to retain traditional UEFI runtime variable services as a
-  fallback.
 
-The MM Communication Protocol remains defined by the PI Specification. This RFC
-does not expose the raw MM Communication Protocol to the operating system and
-does not require the PI Specification to define an operating system ABI.
+It is also proposed that the UEFI specification adds definitions for the following:
 
-Following open development and prototyping, the specification text will be
-submitted to the appropriate UEFI Forum working group as an Engineering Change
-Request (ECR).
+- Definition for the Direct Variable Service data interface.
+- Definition for the Direct Variable Service doorbell methods.
+
+However, due to the nature of the proposed interface it may be desirable to split
+the definition of the Direct Variable Service protocol into a separate specification
+as it's hardware-like interface is different from the usual UEFI definitions.
+
+This proposal makes no explicit change to PI specification based definitions,
+such as the MM Communication Protocol, but the definition defined here is partially
+redundant. For this reason, it attempts to be partially compatible with use for
+MM communicate, but no PI change is required or defined here.
 
 ## Backward Compatibility
 
@@ -259,24 +256,17 @@ The proposal is additive.
 - Platforms implementing the direct interface must continue to expose the
   traditional runtime variable services.
 - An operating system may reject the direct interface during validation and use
-  the traditional interface for that boot.
+  the traditional interface.
 - Table versions, table sizes, feature flags, and reserved command ranges allow
   future compatible extension.
-
-An operating system must not switch between the two interfaces to retry a
-timed-out write while the original direct transaction remains outstanding. The
-result of that write is indeterminate until the matching response is observed
-or the system is reset.
 
 ## Platform/Package Impact
 
 The reference implementation is expected to affect the following EDK II areas:
 
-- `MdePkg`: Public GUID, table, command, packet, flag, and attribute
-  definitions.
-- `MdeModulePkg/Universal/Variable/RuntimeDxe`: Configuration table
-  publication and optional reuse of the direct interface by the compatibility
-  runtime path.
+- `MdePkg`: Public GUID, table, command, packet, flag, and attribute definitions.
+- `MdeModulePkg/Universal/Variable/RuntimeDxe`: Configuration table publication
+  and optional reuse of the direct interface by the compatibility runtime path.
 - Management mode variable services: Request validation, command dispatch, and
   response publication.
 - Platform packages: Communication buffer allocation, memory attributes,
@@ -288,6 +278,15 @@ No platform is required to enable this feature.
 
 ## Unresolved Questions
 
+Interface:
+
+1. What failure reporting is required when the service becomes permanently
+   unavailable after a transaction has been submitted?
+2. Are there any potential variable implementations that are incompatible with
+   this design?
+
+Caching:
+
 1. What is the practical performance difference between the current
    firmware-maintained full-store cache and the proposed caller-managed
    write-through cache?
@@ -295,15 +294,6 @@ No platform is required to enable this feature.
    management mode agents other than the operating system?
 3. Is per-variable non-cacheability sufficient, or is a generation counter or
    full-cache invalidation mechanism also required?
-4. Should the first revision standardize all three proposed doorbells, or
-   standardize the mailbox and one implementation while reserving the others?
-5. Should `COMMAND_GET_ALL_VARIABLES` be part of the first revision or a later
-   performance extension?
-6. Which memory type and UEFI memory map attributes must describe a normal RAM
-   communication buffer so the operating system can safely retain it after
-   `ExitBootServices()`?
-7. What failure reporting is required when the service becomes permanently
-   unavailable after a transaction has been submitted?
 
 ## Prior Art/Related Work
 
@@ -329,37 +319,87 @@ transport while retaining the same architecture-independent mailbox packets.
 
 ## Alternatives
 
-### Isolate Traditional Runtime Services
+### Alternative 1: Sandbox Traditional Runtime Services
 
 One alternative is for the operating system to execute inherited runtime
 services in an isolated address space or virtual machine with a restricted
 second-level translation context. The runtime code would be allowed to access
 only the UEFI runtime regions and hardware resources required for compatibility.
 
+```mermaid
+sequenceDiagram
+participant OS as Kernel
+participant RT as Isolated VM (UEFI RT)
+participant HV as Hypervisor
+
+activate OS
+OS ->>+ HV: Invoke Isolated Thread
+HV ->> HV: Switch Level-1 Page Table
+HV ->> HV: Adjust Access (VMCS)
+HV ->> RT: Invoke w/ restrictions
+deactivate HV
+activate RT
+RT ->> RT: Invoke Management Mode
+RT -->> HV:
+deactivate RT
+activate HV
+HV ->> HV: Restore Page Table
+HV ->> HV: Restore Access (VMCS)
+HV -->>- OS:
+deactivate OS
+```
+
 **Benefits**:
 
 - Requires no platform firmware changes and can be deployed on existing
   systems.
-- The isolation mechanism could be reused for other inherited firmware or
-  interpreted platform code.
+- The isolation mechanism could be reused for other untrusted kernel-mode code.
 
 **Limitations**:
 
 - Adds substantial operating system and transition overhead to execute what is
-  commonly only a translation layer into management mode.
+  commonly only a translation layer into a firmware enclave.
 - Requires the operating system to maintain an additional isolated execution
   context.
 - Creates compatibility risk because runtime firmware may depend on processor
   state or hardware access that is not described by UEFI memory maps.
-- Leaves a larger attack surface than a validated data protocol.
+- Leaves a larger attack surface than a validated data protocol as policy for
+  resources accesses, such as MSRs, may not scale securely.
+- Without standardization, good SMI/SMC invocations may not be discernable from
+  malicious.
 
 This approach remains useful for existing systems, but it does not provide the
 small, explicit trust boundary desired for new platforms.
 
-### Shared Database
+### Alternative 2: Shared Database
 
 Firmware could publish the variable store, or a policy-filtered projection of
 it, as a shared memory structure that the operating system reads directly.
+
+```mermaid
+sequenceDiagram
+participant OS
+participant DB@{ "type" : "database" } as Variable DB
+participant VS as Variable Service
+participant Store@{ "type" : "database" } as Variable Store
+
+activate OS
+OS ->> DB: Acquire Lock (Read)
+OS ->> DB: Read Variable
+activate VS
+VS ->> DB: Acquire Lock (Read)
+VS ->> DB: Read Variable
+OS ->> DB: Release Lock (Read)
+VS ->> DB: Release Lock (Read)
+deactivate VS
+OS ->>+ VS: Write Variable
+VS ->> VS: Validate Write
+VS ->> DB: Acquire Lock (Write)
+VS ->> Store: Write Variable
+VS ->> DB: Write Variable
+VS -->>- OS: Return Result
+deactivate OS
+```
 
 **Benefits**:
 
@@ -373,16 +413,15 @@ it, as a shared memory structure that the operating system reads directly.
   larger and more brittle specification surface than request packets.
 - Constrains firmware internal storage layout or requires firmware to maintain
   and synchronize a second projection.
-- Requires access-restricted variables to be filtered from the projection,
-  duplicating policy and creating divergence risk.
-- Requires a reliable invalidation mechanism for changes that do not originate
-  from the operating system.
-- Does not address writes, which still require a transactional path.
+- Write still still require a transactional path.
+- Creates contention and potential race conditions between OS and service.
+- Requires cache coherency and atomics between OS and service environment for
+  performant operations.
 
 The proposed caller-managed cache obtains most of the steady-state read benefit
 without exposing the firmware store format.
 
-### Expose the MM Communication Buffer
+### Alternative 3: Expose the MM Communication Buffer
 
 The operating system could use the PI MM Communication Protocol and the
 implementation-specific variable communication packets directly.
@@ -401,40 +440,19 @@ implementation-specific variable communication packets directly.
 - Existing packet formats and handler identifiers are implementation details
   and may vary between firmware implementations.
 - It couples the operating system to the firmware's internal architecture.
+- Not written to work with device-based services such as from a coprocessor.
 
 This RFC instead defines the smallest interface needed to preserve the UEFI
 variable service contract.
 
-### Mailbox Protocol (Chosen)
+## Implementation Design
 
 The chosen design uses a firmware-described shared memory communication buffer
-paired with a discoverable doorbell. The operating system writes a request,
-signals the doorbell, and waits for the service to publish a matching response.
-No firmware code executes in the operating system context.
+(mailbox) paired with a discoverable notification method (doorbell). The operating
+system writes a request, signals the doorbell, and waits for the service to
+publish a matching response. No firmware code executes in the operating system context.
 
-**Benefits**:
 
-- Removes inherited firmware code from the operating system trusted computing
-  base.
-- Leaves a small data structure that the operating system can parse and
-  validate independently.
-- Keeps the data model architecture independent.
-- Coexists with traditional runtime services and permits per-boot fallback.
-- Aligns with a mutual-distrust security model between the operating system and
-  firmware.
-
-**Limitations**:
-
-- Requires specification, firmware implementation, and operating system
-  adoption before it provides value.
-- Requires explicit ownership, serialization, memory ordering, and timeout
-  rules.
-- Reserves a communication buffer large enough for the platform maximum
-  variable transaction for the life of the system.
-- Does not by itself remove the cost of entering management mode for each
-  access, which motivates the caching extension.
-
-## Implementation Design
 
 ### Architecture Overview
 
@@ -442,7 +460,11 @@ The operating system loader discovers support before `ExitBootServices()` by
 locating a UEFI configuration table. It validates the table, communication
 buffer, selected doorbell, sizes, versions, and memory attributes. If validation
 succeeds, the operating system may use the direct interface after
-`ExitBootServices()`. Otherwise, it uses the traditional runtime services.
+`ExitBootServices()`. Otherwise, it uses the traditional runtime services. The
+loader must always use traditional runtime services prior to `ExitBootServices()`.
+After `ExitBootServices()` the OS must exclusively use the Direct Variable mechanism
+or transitional runtime services. After invoking one, the other may not be used
+during that boot cycle.
 
 ```mermaid
 sequenceDiagram
