@@ -450,9 +450,8 @@ variable service contract.
 The chosen design uses a firmware-described shared memory communication buffer
 (mailbox) paired with a discoverable notification method (doorbell). The operating
 system writes a request, signals the doorbell, and waits for the service to
-publish a matching response. No firmware code executes in the operating system context.
-
-
+publish a matching response. No firmware code executes in the operating system
+context.
 
 ### Architecture Overview
 
@@ -501,8 +500,11 @@ end
 deactivate OS
 ```
 
-The selected doorbell may be synchronous or asynchronous. Completion is always
-defined by the response state in the communication buffer.
+Thw following diagram further demonstrates the interaction between the OS and the
+variable service using the discovered mailbox and doorbell method. The selected
+doorbell may be synchronous or asynchronous so completion is always defined by the
+response state in the communication buffer. The variable service operates only
+on request, and will not access the mailbox unless processing a request.
 
 ```mermaid
 sequenceDiagram
@@ -514,16 +516,21 @@ participant Store@{ "type" : "database" } as Variable Store
 activate OS
 note over OS: Lock mailbox
 OS ->> MB: Write request and RequestId
-OS ->> MB: Publish request (release)
+OS ->> MB: Publish request
 OS ->> VS: Invoke doorbell
-Note over OS,VS: Doorbell may return before or after completion
+opt Asynchronous
+    VS -->> OS:
+end
 VS ->> MB: Read and snapshot request
 VS ->> Store: Read or update variable
 Store -->> VS: Result
 VS ->> MB: Write response
-VS ->> MB: Publish matching ResponseId (release)
+VS ->> MB: Publish matching ResponseId
+opt Synchronous
+    VS -->> OS:
+end
 loop Wait for completion
-    OS ->> MB: Read ResponseId (acquire)
+    OS ->> MB: Read ResponseId
 end
 OS ->> MB: Read response
 note over OS: Unlock mailbox
@@ -554,10 +561,12 @@ typedef struct {
   UINT32    DoorbellDataSize;
 } EFI_DIRECT_VARIABLE_TABLE;
 
+// Doorbell methods
 #define EFI_DIRECT_VAR_DOORBELL_REGISTER  0x00000000
 #define EFI_DIRECT_VAR_DOORBELL_IO        0x00000001
 #define EFI_DIRECT_VAR_DOORBELL_FFA       0x00000002
 
+// Flag definitions
 #define EFI_DIRECT_VAR_FLAG_MMIO          0x00000001
 #define EFI_DIRECT_VAR_FLAG_VAR_CACHING   0x00000002
 ```
@@ -611,9 +620,9 @@ typedef struct {
 } EFI_DIRECT_VARIABLE_DOORBELL_REGISTER;
 ```
 
-The caller writes `RegisterCommand` to `RegisterAddress` using
-`RegisterWidth`, which must be 1, 2, 4, or 8 bytes. The specification must also
-define byte order and the memory attributes used to access the register.
+The caller writes `RegisterCommand` to `RegisterAddress` using `RegisterWidth`,
+which must be 1, 2, 4, or 8 bytes. The specification must also define byte order
+and the memory attributes used to access the register.
 
 #### I/O Doorbell
 
@@ -654,30 +663,36 @@ advertised buffer size before accessing the payload.
 #define EFI_DIRECT_VARIABLE_HEADER_VERSION  1
 
 typedef struct {
-  UINT64    RequestId;
   UINT32    Command;
-  UINT32    RequestSize;
   UINT32    Reserved;
+} EFI_DIRECT_VARIABLE_HEADER;
+
+typedef struct {
+  EFI_DIRECT_VARIABLE_HEADER  Header;
+  UINT32                      RequestSize;
+  UINT32                      DataOffset;
 } EFI_DIRECT_VARIABLE_REQUEST_HEADER;
 
 typedef struct {
-  UINT64       ResponseId;
-  UINT32       ResponseSize;
-  UINT32       Reserved;
-  EFI_STATUS   ResponseStatus;
+  EFI_DIRECT_VARIABLE_HEADER  Header;
+  UINT32                      RequestSize;
+  UINT32                      DataOffset;
+  EFI_STATUS                  ResponseStatus;
 } EFI_DIRECT_VARIABLE_RESPONSE_HEADER;
-
-typedef struct {
-  UINT32                                 Version;
-  UINT32                                 DataOffset;
-  EFI_DIRECT_VARIABLE_REQUEST_HEADER     RequestHeader;
-  EFI_DIRECT_VARIABLE_RESPONSE_HEADER    ResponseHeader;
-} EFI_DIRECT_VARIABLE_HEADER;
 ```
 
-`DataOffset` is the byte offset from the beginning of the communication buffer
-to the payload region. The same region is used for the request and response.
-Header access must not overlap the payload region.
+`EFI_DIRECT_VARIABLE_HEADER` is common between the command and response, serving
+both the request information as well as the response status for asynchronous
+variable service processing. The requestor will fill this header as well as
+the request specific data before calling the doorbell. After invoking the doorbell
+the requestor must wait for the `Command` field to be set to
+`EFI_DIRECT_VAR_COMMAND_RESPONSE` before processing the response or accessing
+any other data beyond the header.
+
+`DataOffset` both for the request and response is the 64-bit aligned byte offset
+from the beginning of the communication buffer to the payload region. The same
+region is used for the request and response. Header access must not overlap the
+payload region.
 
 The request and response reserved fields must be written as zero and ignored by
 receivers unless a future version assigns meaning to them.
@@ -689,6 +704,7 @@ receivers unless a future version assigns meaning to them.
 #define EFI_DIRECT_VAR_COMMAND_SET_VARIABLE         0x00000003
 #define EFI_DIRECT_VAR_COMMAND_QUERY_VARIABLE_INFO  0x00000004
 #define EFI_DIRECT_VAR_COMMAND_GET_ALL_VARIABLES    0x00000005
+#define EFI_DIRECT_VAR_COMMAND_RESPONSE             0x00010000
 
 #define EFI_DIRECT_VAR_COMMAND_PLATFORM             0x80000000
 ```
@@ -706,32 +722,47 @@ interface cannot expose an undocumented platform command surface at runtime.
 The caller is responsible for ensuring that only one transaction is outstanding
 at a time. It must serialize all users of the interface, acquire its lock before
 accessing the communication buffer, and hold the lock until the response has
-been consumed.
+been sent.
 
-For each transaction, the caller selects a `RequestId` that does not equal the
-current `ResponseId`. The caller writes the complete request, including
-`RequestId`, then performs a release operation and any platform-required cache
-maintenance before invoking the doorbell. Invoking the doorbell transfers
-ownership of the communication buffer to the service.
+For each transaction, the caller writes the complete request, then performs any
+platform-required cache maintenance before invoking the doorbell. Invoking the
+doorbell transfers ownership of the communication buffer to the service.
 
 While the service owns the buffer, the caller must not read or modify any part
-of it except to read `ResponseId` atomically while waiting for completion.
+of it except to read `Command` while waiting for completion.
 
-The service acquires and snapshots the complete request before processing it.
-It must not modify `RequestId`. After processing the request, the service writes
-the complete response and performs a release operation and any
-platform-required cache maintenance. It writes `ResponseId` last, setting it
-equal to `RequestId`, to publish completion and return ownership to the caller.
+The service acquires and copies the complete request before processing it to avoid
+any time-of-check to time-of-use (TOCTOU) vulnerabilities. After completing the
+transaction, the service must write all data and ensure they are visible to the
+caller, including any required cache maintenance, before setting `Command` to
+`EFI_DIRECT_VAR_COMMAND_RESPONSE`. At this point, if the mailbox is synchronous
+it will return. After writing the response command, the ownership of the buffer
+transfers back to the requestor and must not be access by the service until the
+next doorbell invocation.
 
-The caller observes a matching `ResponseId` with an acquire operation and
-performs any platform-required cache maintenance before reading the response. A
-matching identifier guarantees that the response header and payload for that
-request have been published. The caller may then consume the response and reuse
-the buffer.
+The following state machine summarizes communication buffer ownership over a
+transaction:
 
-This protocol defines completion independently of the doorbell. A doorbell may
-return before or after the service completes the request; the caller waits for a
-matching `ResponseId` in both cases.
+```mermaid
+stateDiagram-v2
+    state "Service Owned" as service
+    state "Requestor Owned" as os
+    state "Ready for request" as Ready
+    state "Request Ready" as Request
+    state "Response Ready" as Response
+    state "Service Invoked" as Signal
+
+    state os {
+      [*] --> Ready
+      Ready --> Request: Write Request
+      Request --> Signal: Invoke Doorbell
+      Response --> Done: Write Response Command
+      Done --> Ready : Read Response
+    }
+    state service {
+      Signal --> Response: Write Response Data
+    }
+```
 
 ### Timeout Behavior
 
@@ -740,7 +771,7 @@ of that timeout does not cancel the transaction and does not transfer ownership
 of the communication buffer back to the caller.
 
 After a timeout, the communication buffer remains owned by the service until
-the caller observes `ResponseId` equal to the outstanding `RequestId`. Until
+the caller observes `Command` equal to `EFI_DIRECT_VAR_COMMAND_RESPONSE`. Until
 then, the caller must not:
 
 - Modify the communication buffer.
@@ -749,10 +780,8 @@ then, the caller must not:
 - Reuse the interface.
 - Retry the operation through traditional UEFI runtime services.
 
-The caller may continue reading `ResponseId` atomically to detect late
-completion. If a matching value is subsequently observed with acquire
-semantics, ownership returns to the caller and the response remains
-authoritative.
+The caller may continue reading `Command` to detect late completion, where
+ownership returns to the caller.
 
 A timed-out write has an indeterminate result until a matching response is
 observed. Recovery without observing that response is permitted only after a
